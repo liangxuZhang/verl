@@ -25,11 +25,14 @@ from verl.protocol import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.main_ppo import create_rl_sampler
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+from verl.utils import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
-from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
+from verl.utils.device import get_device_name
+from verl.workers.engine_workers import ActorRolloutRefWorker
+from verl.workers.rollout.llm_server import LLMServerManager
 
 
-def test_agent_loop_reward_manager():
+def test_agent_reward_loop_standalone():
     ray.init(
         runtime_env={
             "env_vars": {
@@ -63,24 +66,23 @@ def test_agent_loop_reward_manager():
     config.trainer.n_gpus_per_node = 8
     config.trainer.nnodes = 1
 
-    config.reward_model.reward_manager = "dapo"
-    config.reward_model.enable = True
-    config.reward_model.enable_resource_pool = False
-    config.reward_model.n_gpus_per_node = 8
-    config.reward_model.model.path = reward_model_path
-    config.reward_model.rollout.name = os.getenv("ROLLOUT_NAME", "vllm")
-    config.reward_model.rollout.gpu_memory_utilization = 0.8
-    config.reward_model.rollout.tensor_model_parallel_size = 2
-    config.reward_model.rollout.skip_tokenizer_init = False
-    config.reward_model.rollout.prompt_length = 5120
-    config.reward_model.rollout.response_length = 4096
-    config.custom_reward_function.path = "tests/experimental/reward_loop/reward_fn.py"
-    config.custom_reward_function.name = "compute_score_gsm8k"
+    config.reward.reward_manager.name = "dapo"
+    config.reward.reward_model.enable = True
+    config.reward.reward_model.enable_resource_pool = False
+    config.reward.reward_model.n_gpus_per_node = 8
+    config.reward.reward_model.model_path = reward_model_path
+    config.reward.reward_model.rollout.name = os.getenv("ROLLOUT_NAME", "vllm")
+    config.reward.reward_model.rollout.gpu_memory_utilization = 0.8
+    config.reward.reward_model.rollout.tensor_model_parallel_size = 2
+    config.reward.reward_model.rollout.skip_tokenizer_init = False
+    config.reward.reward_model.rollout.prompt_length = 5120
+    config.reward.reward_model.rollout.response_length = 4096
+    config.reward.custom_reward_function.path = "tests/experimental/reward_loop/reward_fn.py"
+    config.reward.custom_reward_function.name = "compute_score_gsm8k"
 
     # 1. init reward model manager
-    actor_rollout_cls = (
-        AsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else ActorRolloutRefWorker
-    )
+    # The unified model-engine ActorRolloutRefWorker supports both sync and async rollout modes.
+    actor_rollout_cls = ActorRolloutRefWorker
     global_pool_id = "global_pool"
     resource_pool_spec = {
         global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
@@ -92,20 +94,23 @@ def test_agent_loop_reward_manager():
         cls=ray.remote(actor_rollout_cls), config=config.actor_rollout_ref, role="actor_rollout"
     )
     actor_rollout_wg = RayWorkerGroup(
-        resource_pool=resource_pool,
-        ray_cls_with_init=actor_rollout_cls,
+        resource_pool=resource_pool, ray_cls_with_init=actor_rollout_cls, device_name=get_device_name()
     )
     actor_rollout_wg.init_model()
 
-    agent_loop_manager = AgentLoopManager.create(config, worker_group=actor_rollout_wg)
+    llm_server_manager = LLMServerManager.create(config=config, worker_group=actor_rollout_wg)
+    agent_loop_manager = AgentLoopManager.create(
+        config=config,
+        llm_client=llm_server_manager.get_client(),
+    )
     # sleep rollout replicas
     checkpoint_manager = CheckpointEngineManager(
-        backend=config.actor_rollout_ref.rollout.checkpoint_engine.backend,
+        config=omega_conf_to_dataclass(config.actor_rollout_ref.rollout.checkpoint_engine),
         trainer=actor_rollout_wg,
-        replicas=agent_loop_manager.rollout_replicas,
+        replicas=llm_server_manager.get_replicas(),
     )
     checkpoint_manager.sleep_replicas()
-    reward_loop_manager = RewardLoopManager.create(config, rm_resource_pool=resource_pool)
+    reward_loop_manager = RewardLoopManager(config, rm_resource_pool=resource_pool)
 
     # 2. init test data
     local_folder = os.path.expanduser("~/data/gsm8k/")
@@ -136,11 +141,11 @@ def test_agent_loop_reward_manager():
     batch = DataProto.from_single_dict(batch_dict)
 
     def _get_gen_batch(batch: DataProto) -> DataProto:
-        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = []
-        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
+        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
             non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),

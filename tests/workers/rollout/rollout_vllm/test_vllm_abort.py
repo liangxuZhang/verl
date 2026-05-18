@@ -63,6 +63,8 @@ def test_vllm_abort():
         print("\n[2] Creating config...")
         from hydra import compose, initialize_config_dir
 
+        from verl.utils.tokenizer import normalize_token_ids
+
         config_dir = os.path.abspath("verl/verl/trainer/config")
         if not os.path.exists(config_dir):
             config_dir = os.path.abspath("verl/trainer/config")
@@ -121,7 +123,9 @@ def test_vllm_abort():
         all_prompt_ids = []
         for prompt in prompts[:NUM_PROMPTS]:
             messages = [{"role": "user", "content": prompt}]
-            prompt_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+            prompt_ids = normalize_token_ids(
+                tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+            )
             all_prompt_ids.append(prompt_ids)
         print(f"Prepared {NUM_PROMPTS} prompts")
 
@@ -156,7 +160,6 @@ def test_vllm_abort():
         print("   Calling abort_all_requests...")
         abort_start = time.perf_counter()
         abort_result = ray.get(server_handle.abort_all_requests.remote())
-        ray.get(server_handle.resume_all_requests.remote())
         abort_time = time.perf_counter() - abort_start
 
         print(f"   Abort took: {abort_time * 1000:.2f}ms")
@@ -186,7 +189,7 @@ def test_vllm_abort():
             if output is None:
                 timeout_count += 1
                 print(f"[{i}] {request_id}: TIMEOUT")
-            elif output.stop_reason == "abort":
+            elif output.stop_reason == "aborted":
                 aborted_count += 1
                 print(f"[{i}] {request_id}: ABORTED ({len(output.token_ids)} tokens)")
                 print(f"Partial Output: {tokenizer.decode(output.token_ids)}")
